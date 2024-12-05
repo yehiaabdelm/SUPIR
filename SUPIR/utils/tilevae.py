@@ -827,7 +827,7 @@ class VAEHook:
         @param z: latent vector
         @return: image
         """
-        net = self.net  # The VAE model
+        net = self.net  # The VAE model (Encoder or Decoder)
         tile_size = self.tile_size
         is_decoder = self.is_decoder
 
@@ -891,9 +891,19 @@ class VAEHook:
 
         # Initialize result tensor
         if is_decoder:
-            result_shape = (N, net.out_ch, height * 8, width * 8)
+            output_channels = net.out_ch
+            result_shape = (N, output_channels, height * 8, width * 8)
         else:
-            result_shape = (N, net.z_channels, height // 8, width // 8)
+            # For Encoder, get the output channels
+            if hasattr(net, 'z_channels'):
+                output_channels = net.z_channels
+            elif hasattr(net, 'conv_out'):
+                output_channels = net.conv_out.out_channels
+            elif hasattr(net, 'embed_dim'):
+                output_channels = net.embed_dim
+            else:
+                output_channels = 4  # Default value, adjust as needed
+            result_shape = (N, output_channels, height // 8, width // 8)
         result = torch.zeros(result_shape, dtype=z.dtype)
 
         # Process tiles on each device using threads
