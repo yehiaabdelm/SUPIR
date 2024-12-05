@@ -141,13 +141,13 @@ class SUPIRModel(DiffusionEngine):
         self.first_stage_model.decoder.original_forward = self.first_stage_model.decoder.forward
         self.first_stage_model.denoise_encoder.forward = VAEHook(
             self.first_stage_model.denoise_encoder, encoder_tile_size, is_decoder=False, fast_decoder=False,
-            fast_encoder=False, color_fix=False, to_gpu=True)
+            fast_encoder=False, color_fix=False, to_gpu=False)
         self.first_stage_model.encoder.forward = VAEHook(
             self.first_stage_model.encoder, encoder_tile_size, is_decoder=False, fast_decoder=False,
-            fast_encoder=False, color_fix=False, to_gpu=True)
+            fast_encoder=False, color_fix=False, to_gpu=False)
         self.first_stage_model.decoder.forward = VAEHook(
             self.first_stage_model.decoder, decoder_tile_size, is_decoder=True, fast_decoder=False,
-            fast_encoder=False, color_fix=False, to_gpu=True)
+            fast_encoder=False, color_fix=False, to_gpu=False)
 
     def prepare_condition(self, _z, p, p_p, n_p, N):
         batch = {}

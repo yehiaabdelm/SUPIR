@@ -67,6 +67,8 @@ import torch.version
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from einops import rearrange
+import copy
+import threading
 from diffusers.utils.import_utils import is_xformers_available
 
 import SUPIR.utils.devices as devices
@@ -825,16 +827,13 @@ class VAEHook:
         @param z: latent vector
         @return: image
         """
-        device = next(self.net.parameters()).device
-        dtype = z.dtype
-        net = self.net
+        net = self.net  # The VAE model
         tile_size = self.tile_size
         is_decoder = self.is_decoder
 
         z = z.detach()  # detach the input to avoid backprop
 
-        N, height, width = z.shape[0], z.shape[2], z.shape[3]
-        net.last_z_shape = z.shape
+        N, _, height, width = z.shape
 
         # Split the input into tiles and build a task queue for each tile
         print(f'[Tiled VAE]: input_size: {z.shape}, tile_size: {tile_size}, padding: {self.pad}')
@@ -844,11 +843,10 @@ class VAEHook:
         # Prepare tiles by splitting the input latents
         tiles = []
         for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]].cpu()
+            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]]
             tiles.append(tile)
 
         num_tiles = len(tiles)
-        num_completed = 0
 
         # Build task queues
         single_task_queue = build_task_queue(net, is_decoder)
@@ -882,84 +880,96 @@ class VAEHook:
         devices = [torch.device(f'cuda:{i}') for i in range(num_devices)]
         print(f"[Tiled VAE]: Using {num_devices} GPUs.")
 
-        # Function to process a single tile
-        def process_tile(i, tile, task_queue, input_bbox):
-            tile_device = devices[i % num_devices]
-            tile = tile.to(tile_device)
-            net_tile = net.to(tile_device)
+        # Assign tiles to devices
+        tiles_per_device = {device: [] for device in devices}
+        task_queues_per_device = {device: [] for device in devices}
 
-            group_norm_param = GroupNormParam()
-            interrupted = False
-            while len(task_queue) > 0:
-                task = task_queue.pop(0)
-                if task[0] == 'pre_norm':
-                    group_norm_param.add_tile(tile, task[1])
-                    break  # Move to the next tile after estimating group norm
-                elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
-                    task_id = 0
-                    res = task[1](tile)
-                    if not self.fast_mode or task[0] == 'store_res_cpu':
-                        res = res.cpu()
-                    while task_queue[task_id][0] != 'add_res':
-                        task_id += 1
-                    task_queue[task_id][1] = res
-                elif task[0] == 'add_res':
-                    tile += task[1].to(tile_device)
-                    task[1] = None
-                else:
-                    tile = task[1](tile)
-
-            # Apply group norm if needed
-            group_norm_func = group_norm_param.summary()
-            if group_norm_func is not None:
-                tile = group_norm_func(tile)
-
-            # Continue processing the remaining tasks
-            while len(task_queue) > 0:
-                task = task_queue.pop(0)
-                if task[0] == 'store_res' or task[0] == 'store_res_cpu':
-                    task_id = 0
-                    res = task[1](tile)
-                    if not self.fast_mode or task[0] == 'store_res_cpu':
-                        res = res.cpu()
-                    while task_queue[task_id][0] != 'add_res':
-                        task_id += 1
-                    task_queue[task_id][1] = res
-                elif task[0] == 'add_res':
-                    tile += task[1].to(tile_device)
-                    task[1] = None
-                else:
-                    tile = task[1](tile)
-
-            # Move the result tile to CPU
-            result_tile = tile.cpu()
-            net_tile.to('cpu')
-            return i, result_tile
-
-        # Start multiprocessing
-        ctx = mp.get_context('spawn')  # Use 'spawn' to avoid CUDA issues
-        pool = ctx.Pool(processes=num_devices)
-
-        # Prepare arguments for pool.starmap
-        args = [(i, tiles[i], task_queues[i], in_bboxes[i]) for i in range(num_tiles)]
-
-        # Process tiles in parallel
-        results = pool.starmap(process_tile, args)
-
-        pool.close()
-        pool.join()
+        for idx, (tile, task_queue) in enumerate(zip(tiles, task_queues)):
+            device = devices[idx % num_devices]
+            tiles_per_device[device].append((idx, tile))
+            task_queues_per_device[device].append(task_queue)
 
         # Initialize result tensor
         if is_decoder:
-            result_shape = (N, tile.shape[1], height * 8, width * 8)
+            result_shape = (N, net.out_ch, height * 8, width * 8)
         else:
-            result_shape = (N, tile.shape[1], height // 8, width // 8)
-        result = torch.zeros(result_shape, dtype=dtype)
+            result_shape = (N, net.z_channels, height // 8, width // 8)
+        result = torch.zeros(result_shape, dtype=z.dtype)
+
+        # Process tiles on each device using threads
+        results = []
+        results_lock = threading.Lock()
+
+        def worker(device):
+            net_device = copy.deepcopy(net).to(device)
+
+            for (i, tile), task_queue in zip(tiles_per_device[device], task_queues_per_device[device]):
+                tile = tile.to(device)
+                tile = self.process_tile_on_device(tile, net_device, task_queue, device)
+                tile = tile.cpu()
+                with results_lock:
+                    results.append((i, tile))
+
+        # Start threads for each device
+        threads = []
+        for device in devices:
+            t = threading.Thread(target=worker, args=(device,))
+            t.start()
+            threads.append(t)
+
+        # Wait for all threads to finish
+        for t in threads:
+            t.join()
 
         # Collect and assemble results
-        for res in results:
-            i, tile = res
+        for i, tile in results:
             result[:, :, out_bboxes[i][2]:out_bboxes[i][3], out_bboxes[i][0]:out_bboxes[i][1]] = \
                 crop_valid_region(tile, in_bboxes[i], out_bboxes[i], is_decoder)
 
-        return result.to(dtype)
+        return result
+
+    def process_tile_on_device(self, tile, net_device, task_queue, device):
+        """
+        Process a single tile on the specified device.
+        """
+        group_norm_param = GroupNormParam()
+        interrupted = False
+        while len(task_queue) > 0:
+            task = task_queue.pop(0)
+            if task[0] == 'pre_norm':
+                group_norm_param.add_tile(tile, task[1])
+                break  # Move to the next tile after estimating group norm
+            elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
+                task_id = 0
+                res = task[1](tile)
+                if not self.fast_mode or task[0] == 'store_res_cpu':
+                    res = res.cpu()
+                while task_queue[task_id][0] != 'add_res':
+                    task_id += 1
+                task_queue[task_id][1] = res
+            elif task[0] == 'add_res':
+                tile += task[1].to(device)
+                task[1] = None
+            else:
+                tile = task[1](tile)
+        # Apply group norm if needed
+        group_norm_func = group_norm_param.summary()
+        if group_norm_func is not None:
+            tile = group_norm_func(tile)
+        # Continue processing the remaining tasks
+        while len(task_queue) > 0:
+            task = task_queue.pop(0)
+            if task[0] == 'store_res' or task[0] == 'store_res_cpu':
+                task_id = 0
+                res = task[1](tile)
+                if not self.fast_mode or task[0] == 'store_res_cpu':
+                    res = res.cpu()
+                while task_queue[task_id][0] != 'add_res':
+                    task_id += 1
+                task_queue[task_id][1] = res
+            elif task[0] == 'add_res':
+                tile += task[1].to(device)
+                task[1] = None
+            else:
+                tile = task[1](tile)
+        return tile

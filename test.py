@@ -5,12 +5,12 @@ from PIL import Image
 from llava.llava_agent import LLavaAgent
 from CKPT_PTH import LLAVA_MODEL_PATH
 import os
-from torch import multiprocessing as mp
+# from torch import multiprocessing as mp
 
 
 if __name__ == "__main__":
     # Multiprocessing
-    mp.set_start_method('spawn')
+    # mp.set_start_method('spawn')
 
     if torch.cuda.device_count() >= 2:
         SUPIR_device = 'cuda'
